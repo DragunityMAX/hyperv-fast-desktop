@@ -1305,33 +1305,9 @@ async fn vm_config_from_command_line(
         });
 
     let framebuffer = if opt.gfx || opt.fastdesk.fastdesk || opt.vtl2_gfx || opt.vnc.vnc || opt.pcat {
-        let vram = if let Some(shm_path) = &opt.fastdesk.fastdesk_shm {
-            let mut open_opts = fs_err::OpenOptions::new();
-            open_opts.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
-            }
-            let file = open_opts
-                .open(shm_path)
-                .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .context("setting FastDesk SHM file permissions")?;
-            }
-            file.file()
-                .set_len(vram_size as u64)
-                .context("sizing FastDesk SHM file")?;
-            resources.fastdesk_shm_path = Some(shm_path.to_string_lossy().into_owned());
-            sparse_mmap::new_mappable_from_file(file.file(), true, false)
-                .context("creating FastDesk SHM mappable")?
-        } else {
-            alloc_shared_memory(vram_size, "vram")?
-        };
-        let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
+        let (fb, fba, shm_path) =
+            alloc_framebuffer_vram(opt.fastdesk.fastdesk_shm.as_deref(), vram_size)?;
+        resources.fastdesk_shm_path = shm_path;
         resources.framebuffer_access = Some(fba);
         Some(fb)
     } else {
@@ -2430,7 +2406,7 @@ fn cleanup_socket(path: &Path) {
 }
 
 #[cfg(windows)]
-fn new_switch_port(
+pub(crate) fn new_switch_port(
     switch_id: Option<&str>,
 ) -> anyhow::Result<(
     openvmm_defs::config::SwitchPortId,
@@ -2976,7 +2952,45 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
     result
 }
 
-fn bind_display_tcp_listener(
+pub(crate) fn alloc_framebuffer_vram(
+    shm_path: Option<&Path>,
+    vram_size: usize,
+) -> anyhow::Result<(
+    framebuffer::Framebuffer,
+    FramebufferAccess,
+    Option<String>,
+)> {
+    let (vram, resolved_shm_path) = if let Some(shm_path) = shm_path {
+        let mut open_opts = fs_err::OpenOptions::new();
+        open_opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            fs_err::os::unix::fs::OpenOptionsExt::mode(&mut open_opts, 0o600);
+        }
+        let file = open_opts
+            .open(shm_path)
+            .with_context(|| format!("opening FastDesk SHM file {}", shm_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("setting FastDesk SHM file permissions")?;
+        }
+        file.file()
+            .set_len(vram_size as u64)
+            .context("sizing FastDesk SHM file")?;
+        let mappable = sparse_mmap::new_mappable_from_file(file.file(), true, false)
+            .context("creating FastDesk SHM mappable")?;
+        (mappable, Some(shm_path.to_string_lossy().into_owned()))
+    } else {
+        (alloc_shared_memory(vram_size, "vram")?, None)
+    };
+    let (fb, fba) = framebuffer::framebuffer(vram, vram_size, 0).context("creating framebuffer")?;
+    Ok((fb, fba, resolved_shm_path))
+}
+
+pub(crate) fn bind_display_tcp_listener(
     label: &str,
     listen_str: &str,
     default_port: u16,
@@ -3011,6 +3025,7 @@ fn bind_display_tcp_listener(
             );
         }
     }
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     socket
         .bind(&addr.into())
@@ -3027,6 +3042,65 @@ fn bind_display_tcp_listener(
     }
 
     Ok(socket.into())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn bind_fastdesk_vmsocket_listener(
+    vsock_port: u32,
+) -> anyhow::Result<(vmsocket::VmListener, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        const VMADDR_CID_LOCAL: u32 = 1;
+        const VMADDR_PORT_ANY: u32 = u32::MAX;
+        let requested = if vsock_port == 0 {
+            VMADDR_PORT_ANY
+        } else {
+            vsock_port
+        };
+        let listener = vmsocket::VmListener::bind(vmsocket::VmAddress::vsock(
+            VMADDR_CID_LOCAL,
+            requested,
+        ))
+        .with_context(|| format!("binding FastDesk local vsock port {vsock_port}"))?;
+        let bound_port = listener
+            .local_addr()
+            .context("querying FastDesk vsock local address")?
+            .port();
+        Ok((listener, bound_port))
+    }
+
+    #[cfg(windows)]
+    {
+        // Bind strictly to HV_GUID_LOOPBACK so other Hyper-V guests on the host
+        // cannot connect to this VM's unauthenticated FastDesk listener.
+        const HV_GUID_LOOPBACK: Guid = guid::guid!("e0e16197-dd56-4a10-9195-5ee7a155a838");
+        if vsock_port != 0 {
+            let listener = vmsocket::VmListener::bind(vmsocket::VmAddress::hyperv_vsock(
+                HV_GUID_LOOPBACK,
+                vsock_port,
+            ))
+            .with_context(|| format!("binding FastDesk hvsock loopback port {vsock_port}"))?;
+            return Ok((listener, vsock_port));
+        }
+
+        const MIN_PORT: u32 = 49152;
+        const SPAN: u32 = 0x7fff_ffff - MIN_PORT;
+        for _ in 0..64 {
+            let port = MIN_PORT + (Guid::new_random().data1 % SPAN);
+            match vmsocket::VmListener::bind(vmsocket::VmAddress::hyperv_vsock(
+                HV_GUID_LOOPBACK,
+                port,
+            )) {
+                Ok(listener) => return Ok((listener, port)),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("binding FastDesk hvsock loopback port {port}"));
+                }
+            }
+        }
+        bail!("failed to allocate ephemeral FastDesk hvsock loopback port");
+    }
 }
 
 async fn run_control_inner(
@@ -4185,5 +4259,16 @@ mod tests {
             assert_eq!(error.to_string(), "multiple devices use PCIe port 'custom'");
             mesh.shutdown().await;
         });
+    }
+
+    #[test]
+    fn bind_display_tcp_listener_allocates_distinct_ephemeral_ports() {
+        let a = bind_display_tcp_listener("FastDesk", "127.0.0.1:0", 0).unwrap();
+        let b = bind_display_tcp_listener("FastDesk", "127.0.0.1:0", 0).unwrap();
+        let port_a = a.local_addr().unwrap().port();
+        let port_b = b.local_addr().unwrap().port();
+        assert_ne!(port_a, 0);
+        assert_ne!(port_b, 0);
+        assert_ne!(port_a, port_b);
     }
 }

@@ -27,6 +27,7 @@ use fastdesk_proto::encode_server_msg;
 use fastdesk_worker_defs::FASTDESK_WORKER_TCP;
 #[cfg(any(windows, target_os = "linux"))]
 use fastdesk_worker_defs::FASTDESK_WORKER_VMSOCKET;
+pub use fastdesk_worker_defs::DEFAULT_MAX_CLIENTS;
 use fastdesk_worker_defs::FastDeskParameters;
 use futures::AsyncReadExt;
 use futures::AsyncWriteExt;
@@ -111,6 +112,11 @@ impl Worker for FastDeskWorker<vmsocket::VmListener> {
 
 impl<T: 'static + Listener + MeshField + Send> FastDeskWorker<T> {
     fn new_inner(params: FastDeskParameters<T>) -> anyhow::Result<Self> {
+        let max_clients = if params.max_clients == 0 {
+            DEFAULT_MAX_CLIENTS
+        } else {
+            params.max_clients
+        };
         Ok(Self {
             listener: params.listener,
             view: ViewWrapper(
@@ -123,7 +129,7 @@ impl<T: 'static + Listener + MeshField + Send> FastDeskWorker<T> {
             input_send: params.input_send,
             dirty_recv: params.dirty_recv,
             cursor_recv: params.cursor_recv,
-            max_clients: params.max_clients,
+            max_clients,
         })
     }
 
@@ -437,6 +443,11 @@ impl<T: Listener> MultiClientServer<T> {
                     .set_cached_format(fallback_framebuffer_format(vram_size));
             }
         }
+        let max_clients = if max_clients == 0 {
+            DEFAULT_MAX_CLIENTS
+        } else {
+            max_clients
+        };
         Self {
             listener,
             view: Arc::new(Mutex::new(view)),
@@ -1512,6 +1523,24 @@ mod tests {
         vram_size: usize,
         shm_file: Option<&std::path::Path>,
     ) -> TestServer {
+        start_test_server_with_max_clients(
+            width,
+            height,
+            initial_offset,
+            vram_size,
+            shm_file,
+            8,
+        )
+    }
+
+    fn start_test_server_with_max_clients(
+        width: u16,
+        height: u16,
+        initial_offset: usize,
+        vram_size: usize,
+        shm_file: Option<&std::path::Path>,
+        max_clients: usize,
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1559,7 +1588,7 @@ mod tests {
                     input_send,
                     Some(dirty_recv),
                     Some(cursor_recv),
-                    8,
+                    max_clients,
                 );
                 futures::select! {
                     r = server.process(&driver).fuse() => r,
@@ -3029,6 +3058,26 @@ mod tests {
             }))
         ));
 
+        server.stop();
+    }
+
+    #[test]
+    fn zero_max_clients_uses_default_and_accepts_connections() {
+        let server = start_test_server_with_max_clients(64, 64, 0, FRAMEBUFFER_SIZE, None, 0);
+        let (mut stream1, hello1) = connect_client(server.addr, false);
+        assert!(matches!(hello1, ServerMsg::ServerHello { .. }));
+        assert!(matches!(
+            read_server_msg(&mut stream1).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        let (mut stream2, hello2) = connect_client(server.addr, false);
+        assert!(matches!(hello2, ServerMsg::ServerHello { .. }));
+        assert!(matches!(
+            read_server_msg(&mut stream2).unwrap(),
+            ServerMsg::FrameBatch { .. }
+        ));
+        drop(stream1);
+        drop(stream2);
         server.stop();
     }
 }

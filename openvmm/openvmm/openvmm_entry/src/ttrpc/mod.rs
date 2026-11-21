@@ -35,6 +35,7 @@ use anyhow::Context;
 use anyhow::anyhow;
 use anyhow::bail;
 use chipset_resources::acpi_power_button::PowerButtonRpc;
+use fastdesk_worker_defs::FastDeskParameters;
 use futures::FutureExt;
 use futures::StreamExt;
 use guid::Guid;
@@ -43,6 +44,7 @@ use hyperv_ic_resources::shutdown::ShutdownParams;
 use hyperv_ic_resources::shutdown::ShutdownResult;
 use hyperv_ic_resources::shutdown::ShutdownRpc;
 use hyperv_ic_resources::shutdown::ShutdownType;
+use input_core::MultiplexedInputHandle;
 use inspect::InspectionBuilder;
 use inspect_proto::InspectResponse2;
 use inspect_proto::InspectService;
@@ -102,6 +104,7 @@ use pal_async::DefaultPool;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use scsidisk_resources::SimpleScsiDiskHandle;
+use scsidisk_resources::SimpleScsiDvdHandle;
 use std::fs::File;
 use std::future::Future;
 use std::path::Path;
@@ -111,7 +114,11 @@ use std::time::Duration;
 use storvsp_resources::ScsiControllerHandle;
 use storvsp_resources::ScsiControllerRequest;
 use storvsp_resources::ScsiDeviceAndPath;
+use uidevices_resources::SynthKeyboardHandle;
+use uidevices_resources::SynthMouseHandle;
+use uidevices_resources::SynthVideoHandle;
 use unix_socket::UnixListener;
+use video_core::SharedFramebufferHandle;
 use virtio_resources::VirtioPciDeviceHandle;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::IntoResource;
@@ -124,6 +131,7 @@ use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vmgs_resources::GuestStateEncryptionPolicy;
 use vmgs_resources::VmgsResource;
+use vmotherboard::ChipsetDeviceHandle;
 use vmservice::uefi::initial_variables::SecureBootTemplate;
 
 #[cfg(guest_arch = "aarch64")]
@@ -393,11 +401,16 @@ impl Worker for TtrpcWorker {
                 controller_task: None,
                 wait_vm_response: None,
                 lifecycle: VmLifecycle::Uninitialized,
+                halted_paused: false,
                 snapshot_saved: false,
                 memory_backing_file: None,
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
                 registry: FdRegistry::default(),
+                #[cfg(windows)]
+                switch_ports: Default::default(),
+                fastdesk_listen_addr: None,
+                fastdesk_shm_path: None,
             };
             let code = service.run(self.listener, recv).await?;
             self.exit_code.send(code);
@@ -549,6 +562,10 @@ impl VmService {
         if let Some(vm) = self.vm.take() {
             let _ = Arc::try_unwrap(vm).ok().expect("no more VM references");
         }
+        // Release Windows switch ports only after the controller and VM worker
+        // have exited so DIO endpoints are never torn down under a live worker.
+        #[cfg(windows)]
+        self.switch_ports.lock().clear();
         drop(cancel_send);
         server_task.await?;
         Ok(0)
@@ -665,10 +682,14 @@ fn validate_platform_config(config: &vmservice::VmConfig) -> anyhow::Result<()> 
             config.hvsocket_config.is_none(),
             "HVSocket requires VMBus to be enabled"
         );
+        anyhow::ensure!(
+            config.fastdesk_config.is_none(),
+            "FastDesk requires VMBus to be enabled"
+        );
         if let Some(devices) = &config.devices_config {
             anyhow::ensure!(
-                devices.scsi_disks.is_empty(),
-                "SCSI disks require VMBus; use PCIe NVMe or virtio-blk instead"
+                devices.scsi_disks.is_empty() && !devices.enable_scsi_controller,
+                "SCSI disks and controller require VMBus; use PCIe NVMe or virtio-blk instead"
             );
             anyhow::ensure!(
                 devices
@@ -818,6 +839,7 @@ struct VmService {
     controller_task: Option<Task<()>>,
     wait_vm_response: Option<(mesh::CancelContext, mesh::OneshotSender<Result<(), Status>>)>,
     lifecycle: VmLifecycle,
+    halted_paused: bool,
     snapshot_saved: bool,
     /// The current VM's guest memory backing file, if any. SaveVM requires
     /// one.
@@ -827,6 +849,10 @@ struct VmService {
     /// Registry of file descriptors passed in over the fd-passing protocol,
     /// resolvable by name (e.g. for tap NIC backends).
     registry: FdRegistry,
+    #[cfg(windows)]
+    switch_ports: Arc<parking_lot::Mutex<std::collections::HashMap<Guid, vmswitch::kernel::SwitchPort>>>,
+    fastdesk_listen_addr: Option<String>,
+    fastdesk_shm_path: Option<String>,
 }
 
 fn grpc_error(err: anyhow::Error) -> Status {
@@ -878,7 +904,12 @@ impl VmService {
                 if let Some(task) = self.controller_task.take() {
                     task.await;
                 }
+                #[cfg(windows)]
+                self.switch_ports.lock().clear();
                 self.vm_controller_events.take();
+                self.halted_paused = false;
+                self.fastdesk_listen_addr = None;
+                self.fastdesk_shm_path = None;
                 if let Some((_, wait_response)) = self.wait_vm_response.take() {
                     wait_response.send(Err(grpc_error(anyhow!("VM quit"))));
                 }
@@ -896,6 +927,9 @@ impl VmService {
             }
             vmservice::Vm::ResumeVm((), response) => {
                 response.send(map_grpc(self.resume_vm().await));
+            }
+            vmservice::Vm::ResetVm((), response) => {
+                response.send(map_grpc(self.reset_vm().await));
             }
             vmservice::Vm::SaveVm(request, response) => {
                 // Stop waiting if the client cancels or its deadline expires.
@@ -1101,6 +1135,29 @@ impl VmService {
 
         validate_platform_config(&req_config)?;
 
+        let fastdesk_cfg = req_config.fastdesk_config.take();
+        let mut fastdesk_access = None;
+        let mut fastdesk_shm_path = None;
+        let mut fastdesk_dirty_recv = None;
+        let mut fastdesk_cursor_recv = None;
+        let mut fastdesk_vram_size = 0usize;
+        let framebuffer = if let Some(fd) = &fastdesk_cfg {
+            let vram_mb = if fd.vram_mb == 0 { 32 } else { fd.vram_mb };
+            let vram_size = (vram_mb.clamp(8, 256) as usize) * 1024 * 1024;
+            fastdesk_vram_size = vram_size;
+            let shm = fd
+                .shm_path
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(Path::new);
+            let (fb, fba, resolved_shm_path) = crate::alloc_framebuffer_vram(shm, vram_size)?;
+            fastdesk_access = Some(fba);
+            fastdesk_shm_path = resolved_shm_path;
+            Some(fb)
+        } else {
+            None
+        };
+
         let vmgs = build_vmgs(req_config.vmgs.take()).await?;
         let iommufds = IommufdContexts::new(std::mem::take(&mut req_config.iommufds))?;
 
@@ -1132,6 +1189,10 @@ impl VmService {
         // Build SMBIOS identity for direct Linux or UEFI boot.
         let smbios_requested = req_config.smbios_config.is_some();
         let smbios = Box::new(smbios_config_from_proto(req_config.smbios_config.take())?);
+        let bios_guid = smbios.system.uuid;
+        let tpm_version = req_config
+            .tpm_enabled
+            .then_some(tpm_resources::TpmVersion::V185);
 
         let isolation = match req_config.isolation_config.take() {
             // Unset isolation config defaults to no isolation
@@ -1169,6 +1230,9 @@ impl VmService {
                 if isolation.is_some() {
                     bail!("VM-service SNP isolation currently supports only IGVM boot");
                 }
+                if tpm_version.is_some() {
+                    bail!("vTPM requires UEFI boot");
+                }
                 let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
                 let initrd = if boot.initrd_path.is_empty() {
                     None
@@ -1200,6 +1264,9 @@ impl VmService {
                 }
                 if !matches!(isolation, Some(IsolationType::Snp { .. })) {
                     bail!("VM-service IGVM boot currently supports only SNP isolation");
+                }
+                if tpm_version.is_some() {
+                    bail!("vTPM requires UEFI boot");
                 }
                 let base_chipset_type = match boot.personality() {
                     vmservice::igvm_boot::Personality::Unspecified => {
@@ -1244,11 +1311,12 @@ impl VmService {
                         firmware,
                         enable_serial: any_serial_configured,
                         // Route the firmware console to COM1 when it is
-                        // available. The firmware's default console is the
-                        // video device, so without this the firmware and
-                        // anything it launches would have nowhere to write on a
-                        // VM with no graphics adapter.
-                        uefi_console_mode: com1_configured.then_some(UefiConsoleMode::Com1),
+                        // available and FastDesk video is not enabled.
+                        uefi_console_mode: if fastdesk_cfg.is_some() {
+                            Some(UefiConsoleMode::Default)
+                        } else {
+                            com1_configured.then_some(UefiConsoleMode::Com1)
+                        },
                         smbios,
                         enable_vmbus: !req_config.disable_vmbus,
                         enable_hv: !req_config.disable_hv,
@@ -1262,7 +1330,7 @@ impl VmService {
                         enable_memory_protections: false,
                         enable_debugging: false,
                         disable_frontpage: false,
-                        tpm_version: None,
+                        tpm_version,
                         enable_battery: false,
                         enable_vpci_boot: false,
                         default_boot_always_attempt: false,
@@ -1293,6 +1361,9 @@ impl VmService {
 
         let mut chipset_builder =
             VmManifestBuilder::new(base_chipset_type, arch).with_serial(ports);
+        if framebuffer.is_some() {
+            chipset_builder = chipset_builder.with_framebuffer();
+        }
         let acpi_power_button_rpc = if supports_acpi_power_button(&load_mode) {
             let (send, recv) = mesh::channel();
             let irq = match arch {
@@ -1405,7 +1476,7 @@ impl VmService {
             #[cfg(windows)]
             kernel_vmnics: vec![],
             input: mesh::Receiver::new(),
-            framebuffer: None,
+            framebuffer,
             vga_firmware: None,
             vtl2_gfx: false,
             virtio_devices: vec![],
@@ -1439,8 +1510,44 @@ impl VmService {
 
         let mut scsi_rpc = None;
         let mut consomme_rpc = std::collections::HashMap::new();
+        #[cfg(windows)]
+        let mut switch_ports = std::collections::HashMap::new();
+
+        if fastdesk_cfg.is_some() {
+            let (dirt_send, dirt_recv) = mesh::channel();
+            fastdesk_dirty_recv = Some(dirt_recv);
+            let (cursor_send, cursor_recv) = mesh::channel();
+            fastdesk_cursor_recv = Some(cursor_recv);
+            config.vmbus_devices.extend([
+                (
+                    DeviceVtl::Vtl0,
+                    SynthVideoHandle {
+                        framebuffer: SharedFramebufferHandle.into_resource(),
+                        dirt_send: Some(dirt_send),
+                        cursor_send: Some(cursor_send),
+                        vram_size: Some(fastdesk_vram_size),
+                    }
+                    .into_resource(),
+                ),
+                (
+                    DeviceVtl::Vtl0,
+                    SynthKeyboardHandle {
+                        source: MultiplexedInputHandle { elevation: 1 }.into_resource(),
+                    }
+                    .into_resource(),
+                ),
+                (
+                    DeviceVtl::Vtl0,
+                    SynthMouseHandle {
+                        source: MultiplexedInputHandle { elevation: 1 }.into_resource(),
+                    }
+                    .into_resource(),
+                ),
+            ]);
+        }
+
         if let Some(devices_config) = req_config.devices_config {
-            if !devices_config.scsi_disks.is_empty() {
+            if !devices_config.scsi_disks.is_empty() || devices_config.enable_scsi_controller {
                 let mut devices = Vec::new();
                 for disk in devices_config.scsi_disks {
                     devices.push(make_disk_config(disk).await?);
@@ -1476,7 +1583,12 @@ impl VmService {
                 } else {
                     None
                 };
-                match parse_nic_config(nic, recv, &registry)? {
+                let parsed_nic = parse_nic_config(nic, recv, &registry)?;
+                #[cfg(windows)]
+                if let Some((nic_id, port)) = parsed_nic.switch_port {
+                    switch_ports.insert(nic_id, port);
+                }
+                match parsed_nic.device {
                     NicDevice::Vmbus(resource) => {
                         config.vmbus_devices.push((DeviceVtl::Vtl0, resource));
                     }
@@ -1569,6 +1681,45 @@ impl VmService {
             .await
             .context("spawning vm process failed")?;
 
+        if let Some(tpm_version) = tpm_version {
+            let register_layout = if cfg!(guest_arch = "x86_64") {
+                tpm_resources::TpmRegisterLayout::IoPort
+            } else {
+                tpm_resources::TpmRegisterLayout::Mmio
+            };
+            let with_vmgs = config.vmgs.is_some();
+            let ppi_store =
+                crate::non_volatile_store_resource(with_vmgs, vmgs_format::FileId::TPM_PPI);
+            let nvram_store = crate::non_volatile_store_resource(
+                with_vmgs,
+                tpm_vmgs::tpm_nvram_file_id(tpm_version),
+            );
+            config.chipset_devices.push(ChipsetDeviceHandle {
+                name: "tpm".to_string(),
+                resource: chipset_device_worker_defs::RemoteChipsetDeviceHandle {
+                    device: tpm_resources::TpmDeviceHandle {
+                        version: tpm_version,
+                        ppi_store,
+                        nvram_store,
+                        nvram_size: None,
+                        refresh_tpm_seeds: false,
+                        ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
+                        register_layout,
+                        guest_secret_key: None,
+                        logger: None,
+                        is_confidential_vm: false,
+                        bios_guid,
+                    }
+                    .into_resource(),
+                    worker_host: mesh
+                        .make_host("tpm", None)
+                        .await
+                        .context("spawning tpm process failed")?,
+                }
+                .into_resource(),
+            });
+        }
+
         let (shared_memory, saved_state, active_memory_backing_file, snapshot_id) =
             if let Some(restore) = &restore {
                 let prepared =
@@ -1591,6 +1742,74 @@ impl VmService {
                     .transpose()?;
                 (shared_memory, None, memory_backing_file, None)
             };
+
+        let (fastdesk_worker, fastdesk_listen_addr) = if let Some(fd) = fastdesk_cfg {
+            let input_send = config.input.sender();
+            let framebuffer = fastdesk_access.take().expect("fastdesk framebuffer");
+            let shm_path = fastdesk_shm_path.clone();
+            let dirty_recv = fastdesk_dirty_recv.take();
+            let cursor_recv = fastdesk_cursor_recv.take();
+            let max_clients = resolve_fastdesk_max_clients(fd.max_clients);
+            let fastdesk_host = mesh
+                .make_host("fastdesk", None)
+                .await
+                .context("spawning fastdesk process failed")?;
+
+            if let Some(vsock_port) = fd.vsock_port {
+                #[cfg(any(windows, target_os = "linux"))]
+                {
+                    let (listener, bound_port) = crate::bind_fastdesk_vmsocket_listener(vsock_port)?;
+                    let worker = fastdesk_host
+                        .launch_worker(
+                            fastdesk_worker_defs::FASTDESK_WORKER_VMSOCKET,
+                            FastDeskParameters {
+                                listener,
+                                framebuffer,
+                                shm_path,
+                                input_send,
+                                dirty_recv,
+                                cursor_recv,
+                                max_clients,
+                            },
+                        )
+                        .await?;
+                    let addr = if cfg!(windows) {
+                        format!("hvsock://loopback/{bound_port}")
+                    } else {
+                        format!("vsock://local:{bound_port}")
+                    };
+                    (Some(worker), Some(addr))
+                }
+                #[cfg(not(any(windows, target_os = "linux")))]
+                {
+                    let _ = vsock_port;
+                    bail!("FastDesk vsock_port is only supported on Windows and Linux");
+                }
+            } else {
+                let listen_str = default_fastdesk_listen_addr(&fd.listen_addr);
+                let listener = crate::bind_display_tcp_listener("FastDesk", listen_str, 0)?;
+                let local_addr = listener
+                    .local_addr()
+                    .context("querying FastDesk TCP listener address")?;
+                let worker = fastdesk_host
+                    .launch_worker(
+                        fastdesk_worker_defs::FASTDESK_WORKER_TCP,
+                        FastDeskParameters {
+                            listener,
+                            framebuffer,
+                            shm_path,
+                            input_send,
+                            dirty_recv,
+                            cursor_recv,
+                            max_clients,
+                        },
+                    )
+                    .await?;
+                (Some(worker), Some(format!("tcp://{local_addr}")))
+            }
+        } else {
+            (None, None)
+        };
 
         let worker = vm_host
             .launch_worker(
@@ -1618,7 +1837,7 @@ impl VmService {
             mesh,
             vm_worker: worker,
             vnc_worker: None,
-            fastdesk_worker: None,
+            fastdesk_worker,
             gdb_worker: None,
             diag_inspector: None,
             vtl2_settings: None,
@@ -1643,6 +1862,10 @@ impl VmService {
         self.vm_controller = Some(vm_controller_send);
         self.vm_controller_events = Some(event_recv);
         self.controller_task = Some(controller_task);
+        #[cfg(windows)]
+        {
+            *self.switch_ports.lock() = switch_ports;
+        }
         self.vm = Some(Arc::new(Vm {
             shutdown_rpc,
             acpi_power_button_rpc,
@@ -1653,6 +1876,9 @@ impl VmService {
         }));
         self.snapshot_saved = false;
         self.memory_backing_file = active_memory_backing_file;
+        self.fastdesk_listen_addr = fastdesk_listen_addr;
+        self.fastdesk_shm_path = fastdesk_shm_path;
+        self.halted_paused = false;
         self.lifecycle = VmLifecycle::Paused;
         Ok(snapshot_id)
     }
@@ -1670,10 +1896,15 @@ impl VmService {
         if let Some(task) = self.controller_task.take() {
             task.await;
         }
+        #[cfg(windows)]
+        self.switch_ports.lock().clear();
         self.vm_controller_events.take();
+        self.halted_paused = false;
         self.lifecycle = VmLifecycle::Uninitialized;
         self.snapshot_saved = false;
         self.memory_backing_file = None;
+        self.fastdesk_listen_addr = None;
+        self.fastdesk_shm_path = None;
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
         }
@@ -1690,6 +1921,8 @@ impl VmService {
             processor_stats: None,
             state: vmservice::VmState::from(&self.lifecycle) as i32,
             halt_reason,
+            fastdesk_listen_addr: self.fastdesk_listen_addr.clone(),
+            fastdesk_shm_path: self.fastdesk_shm_path.clone(),
         }
     }
 
@@ -1826,7 +2059,9 @@ impl VmService {
             .await
             .map(drop)
             .context("pause failed")?;
-        if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
+        if matches!(self.lifecycle, VmLifecycle::Halted(_)) {
+            self.halted_paused = true;
+        } else {
             self.lifecycle = VmLifecycle::Paused;
         }
         Ok(())
@@ -1842,8 +2077,30 @@ impl VmService {
             .await
             .map(drop)
             .context("resume failed")?;
-        if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
+        if matches!(self.lifecycle, VmLifecycle::Halted(_)) {
+            self.halted_paused = false;
+        } else {
             self.lifecycle = VmLifecycle::Running;
+        }
+        Ok(())
+    }
+
+    async fn reset_vm(&mut self) -> anyhow::Result<()> {
+        if self.snapshot_saved {
+            bail!("cannot reset a VM after SaveVM");
+        }
+        let vm = self.vm.clone().context("VM not created yet")?;
+        vm.worker_rpc
+            .call_failable(VmRpc::Reset, ())
+            .await
+            .context("reset failed")?;
+        if matches!(self.lifecycle, VmLifecycle::Halted(_)) {
+            self.lifecycle = if self.halted_paused {
+                VmLifecycle::Paused
+            } else {
+                VmLifecycle::Running
+            };
+            self.halted_paused = false;
         }
         Ok(())
     }
@@ -1913,6 +2170,7 @@ impl VmService {
         match event {
             VmControllerEvent::GuestHalt(reason) => {
                 tracing::info!(%reason, "guest halted (via controller)");
+                self.halted_paused = matches!(self.lifecycle, VmLifecycle::Paused);
                 self.lifecycle = VmLifecycle::Halted(reason);
                 if let Some((_, response)) = self.wait_vm_response.take() {
                     response.send(Ok(()));
@@ -1940,6 +2198,11 @@ impl VmService {
                 // task will be awaited during final cleanup.
                 self.vm.take();
                 self.vm_controller.take();
+                #[cfg(windows)]
+                self.switch_ports.lock().clear();
+                self.halted_paused = false;
+                self.fastdesk_listen_addr = None;
+                self.fastdesk_shm_path = None;
                 self.lifecycle = VmLifecycle::Uninitialized;
             }
             VmControllerEvent::VncWorkerStopped { error } => {
@@ -2022,13 +2285,20 @@ impl VmService {
             .instance_id
             .parse()
             .context("invalid VPCI instance ID")?;
+        #[cfg(windows)]
+        let switch_ports = self.switch_ports.clone();
         let recv = self
             .vm
             .as_ref()
             .context("VM not created yet")?
             .worker_rpc
             .call_failable(VmRpc::RemoveVpciDevice, instance_id);
-        Ok(async move { recv.await.map_err(anyhow::Error::from) })
+        Ok(async move {
+            recv.await.map_err(anyhow::Error::from)?;
+            #[cfg(windows)]
+            switch_ports.lock().remove(&instance_id);
+            Ok(())
+        })
     }
 
     fn modify_resource(
@@ -2087,18 +2357,27 @@ impl VmService {
                              configure it at VM creation time"
                         );
                     }
-                    let NicDevice::Vmbus(resource) = parse_nic_config(nic, None, &self.registry)?
+                    let parsed_nic = parse_nic_config(nic, None, &self.registry)?;
+                    let NicDevice::Vmbus(resource) = parsed_nic.device
                     else {
                         anyhow::bail!(
                             "adding a virtio NIC via ModifyResource is not supported; \
                              configure it at VM creation time"
                         );
                     };
+                    #[cfg(windows)]
+                    let switch_port = parsed_nic.switch_port;
+                    #[cfg(windows)]
+                    let switch_ports = self.switch_ports.clone();
                     let recv = vm
                         .worker_rpc
                         .call_failable(VmRpc::AddVmbusDevice, (DeviceVtl::Vtl0, resource));
                     Ok(async move {
                         recv.await.map_err(anyhow::Error::from)?;
+                        #[cfg(windows)]
+                        if let Some((nic_id, port)) = switch_port {
+                            switch_ports.lock().insert(nic_id, port);
+                        }
                         Ok(vmservice::ModifyResourceResponse::default())
                     }
                     .boxed())
@@ -2438,6 +2717,14 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
     })
 }
 
+fn default_fastdesk_listen_addr(raw: &str) -> &str {
+    if raw.is_empty() {
+        "127.0.0.1:0"
+    } else {
+        raw
+    }
+}
+
 enum NicDevice {
     Vmbus(Resource<VmbusDeviceHandleKind>),
     Virtio {
@@ -2446,16 +2733,29 @@ enum NicDevice {
     },
 }
 
+struct ParsedNic {
+    device: NicDevice,
+    #[cfg(windows)]
+    switch_port: Option<(Guid, vmswitch::kernel::SwitchPort)>,
+}
+
 fn parse_nic_config(
     nic: vmservice::NicConfig,
     recv: Option<mesh::Receiver<ConsommeRequest>>,
     registry: &FdRegistry,
-) -> anyhow::Result<NicDevice> {
+) -> anyhow::Result<ParsedNic> {
     use self::vmservice::nic_config::Backend;
     #[cfg(not(target_os = "linux"))]
     let _ = registry;
     let frontend = vmservice::NicFrontend::from_i32(nic.frontend)
         .with_context(|| format!("unknown NIC frontend {}", nic.frontend))?;
+    let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
+    let mac_address = nic
+        .mac_address
+        .parse::<MacAddress>()
+        .context("invalid mac address")?;
+    #[cfg(windows)]
+    let mut allocated_port = None;
     let endpoint = match nic.backend.context("missing backend")? {
         #[cfg(windows)]
         Backend::LegacyPortId(port_id) => net_backend_resources::dio::WindowsDirectIoHandle {
@@ -2466,24 +2766,31 @@ fn parse_nic_config(
         }
         .into_resource(),
         #[cfg(windows)]
-        Backend::Dio(dio) => net_backend_resources::dio::WindowsDirectIoHandle {
-            switch_port_id: net_backend_resources::dio::SwitchPortId {
-                switch: dio.switch_id.parse().context("invalid switch ID")?,
-                port: dio.port_id.parse().context("invalid port ID")?,
-            },
+        Backend::Dio(dio) => {
+            let switch_port_id = if dio.port_id.is_empty() {
+                let switch_str = (!dio.switch_id.is_empty()
+                    && !dio.switch_id.eq_ignore_ascii_case("default"))
+                .then_some(dio.switch_id.as_str());
+                let (id, port) = crate::new_switch_port(switch_str)?;
+                allocated_port = Some((instance_id, port));
+                net_backend_resources::dio::SwitchPortId {
+                    switch: id.switch,
+                    port: id.port,
+                }
+            } else {
+                net_backend_resources::dio::SwitchPortId {
+                    switch: dio.switch_id.parse().context("invalid switch ID")?,
+                    port: dio.port_id.parse().context("invalid port ID")?,
+                }
+            };
+            net_backend_resources::dio::WindowsDirectIoHandle { switch_port_id }.into_resource()
         }
-        .into_resource(),
         #[cfg(target_os = "linux")]
         Backend::Tap(tap) => build_tap_backend(tap, registry)?,
         Backend::Consomme(consomme) => build_consomme_handle(consomme, recv)?.into_resource(),
         _ => anyhow::bail!("unsupported backend"),
     };
-    let instance_id = nic.nic_id.parse().context("invalid instance ID")?;
-    let mac_address = nic
-        .mac_address
-        .parse::<MacAddress>()
-        .context("invalid mac address")?;
-    Ok(match frontend {
+    let device = match frontend {
         vmservice::NicFrontend::Vmbus => NicDevice::Vmbus(
             NetvspHandle {
                 instance_id,
@@ -2503,31 +2810,73 @@ fn parse_nic_config(
             }
             .into_resource(),
         },
+    };
+    Ok(ParsedNic {
+        device,
+        #[cfg(windows)]
+        switch_port: allocated_port,
     })
 }
 
 async fn make_disk_config(disk: vmservice::ScsiDisk) -> anyhow::Result<ScsiDeviceAndPath> {
+    let read_only = disk.read_only || disk.is_dvd;
+    let options = OpenDiskOptions {
+        read_only,
+        direct: false,
+    };
+    let device = if disk.is_dvd {
+        let media = if disk.host_path.is_empty() {
+            None
+        } else {
+            Some(
+                openvmm_helpers::disk::open_raw_disk_file(
+                    disk.host_path.as_ref(),
+                    OpenDiskOptions {
+                        read_only: true,
+                        direct: false,
+                    },
+                )
+                .with_context(|| format!("failed to open {}", disk.host_path))?,
+            )
+        };
+        SimpleScsiDvdHandle {
+            media,
+            requests: None,
+        }
+        .into_resource()
+    } else {
+        let disk_handle = match vmservice::DiskType::from_i32(disk.r#type) {
+            Some(vmservice::DiskType::ScsiDiskTypeVhdx) => {
+                openvmm_helpers::disk::open_vhdx_disk(disk.host_path.as_ref(), options).await
+            }
+            Some(vmservice::DiskType::ScsiDiskTypePhysical)
+            | Some(vmservice::DiskType::ScsiDiskTypeVhd1)
+            | None => open_disk_type(disk.host_path.as_ref(), options).await,
+        }
+        .with_context(|| format!("failed to open {}", disk.host_path))?;
+        SimpleScsiDiskHandle {
+            disk: disk_handle,
+            read_only,
+            parameters: Default::default(),
+        }
+        .into_resource()
+    };
     Ok(ScsiDeviceAndPath {
         path: storvsp_resources::ScsiPath {
             path: 0,
             target: 0,
             lun: disk.lun.try_into().ok().context("lun value out of range")?,
         },
-        device: SimpleScsiDiskHandle {
-            disk: open_disk_type(
-                disk.host_path.as_ref(),
-                OpenDiskOptions {
-                    read_only: disk.read_only,
-                    direct: false,
-                },
-            )
-            .await
-            .with_context(|| format!("failed to open {}", disk.host_path))?,
-            read_only: disk.read_only,
-            parameters: Default::default(),
-        }
-        .into_resource(),
+        device,
     })
+}
+
+fn resolve_fastdesk_max_clients(max_clients: u32) -> usize {
+    if max_clients == 0 {
+        fastdesk_worker_defs::DEFAULT_MAX_CLIENTS
+    } else {
+        max_clients as usize
+    }
 }
 
 /// Applies the MMIO gap sizes from the request's `MemoryConfig` to the
@@ -3439,11 +3788,16 @@ mod tests {
             controller_task: None,
             wait_vm_response: None,
             lifecycle: VmLifecycle::Running,
+            halted_paused: false,
             snapshot_saved: false,
             memory_backing_file: None,
             rpc_tasks: Vec::new(),
             transport: ResolvedTransport::Auto,
             registry: FdRegistry::default(),
+            #[cfg(windows)]
+            switch_ports: Default::default(),
+            fastdesk_listen_addr: None,
+            fastdesk_shm_path: None,
         }
     }
 
@@ -4363,15 +4717,132 @@ mod tests {
                     controller_task: None,
                     wait_vm_response: None,
                     lifecycle: VmLifecycle::Running,
+                    halted_paused: false,
                     snapshot_saved: false,
                     memory_backing_file: None,
                     rpc_tasks: vec![driver.spawn("pending-rpc", std::future::pending())],
                     transport: ResolvedTransport::Auto,
                     registry: FdRegistry::default(),
+                    #[cfg(windows)]
+                    switch_ports: Default::default(),
+                    fastdesk_listen_addr: None,
+                    fastdesk_shm_path: None,
                 };
                 event_send.send(VmControllerEvent::ExitRequested { code });
                 assert_eq!(service.run(listener, worker_recv).await.unwrap(), code);
             }
+        });
+    }
+
+    #[cfg(feature = "ttrpc")]
+    #[test]
+    fn wait_vm_disconnect_releases_slot_for_next_client() {
+        DefaultPool::run_with(async |driver| {
+            let dir = tempfile::tempdir().unwrap();
+            let sock_path = dir.path().join("rpc.sock");
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let (event_send, event_recv) = mesh::channel();
+            let (_worker_send, worker_recv) = mesh::channel();
+            let mut svc = service(driver.clone(), None);
+            svc.vm_controller_events = Some(event_recv);
+            svc.transport = ResolvedTransport::Ttrpc;
+
+            let server_task =
+                driver.spawn("vm-service-wait-vm", async move { svc.run(listener, worker_recv).await });
+
+            let connect = |sock: &Path| {
+                let stream = unix_socket::UnixStream::connect(sock).unwrap();
+                mesh_rpc::Client::new(
+                    &driver,
+                    mesh_rpc::client::ExistingConnection::new(
+                        pal_async::socket::PolledSocket::new(&driver, stream).unwrap(),
+                    ),
+                )
+            };
+
+            // Client 1 acquires the single WaitVM slot and confirms it is registered.
+            let client1 = connect(&sock_path);
+            let _wait1 = client1.call().start(vmservice::Vm::WaitVm, ());
+            let props1 = client1
+                .call()
+                .start(
+                    vmservice::Vm::PropertiesVm,
+                    vmservice::PropertiesVmRequest { types: vec![] },
+                )
+                .await
+                .unwrap();
+            assert_eq!(props1.state, vmservice::VmState::Running as i32);
+
+            let probe1 = connect(&sock_path);
+            let err1 = probe1
+                .call()
+                .start(vmservice::Vm::WaitVm, ())
+                .await
+                .unwrap_err();
+            assert!(
+                err1.message.contains("wait VM already in flight"),
+                "unexpected error while WaitVM active: {err1:?}"
+            );
+            probe1.shutdown().await;
+
+            // Disconnecting Client 1 must cancel its WaitVM so Client 2 can re-attach.
+            drop(_wait1);
+            client1.shutdown().await;
+
+            let mut timer = pal_async::timer::PolledTimer::new(&driver);
+            let mut acquired = None;
+            for _ in 0..40 {
+                let c = connect(&sock_path);
+                let mut w = Box::pin(c.call().start(vmservice::Vm::WaitVm, ()));
+                let props2 = c
+                    .call()
+                    .start(
+                        vmservice::Vm::PropertiesVm,
+                        vmservice::PropertiesVmRequest { types: vec![] },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(props2.state, vmservice::VmState::Running as i32);
+                timer.sleep(Duration::from_millis(10)).await;
+                match (&mut w).now_or_never() {
+                    Some(Err(err)) => {
+                        assert!(
+                            err.message.contains("wait VM already in flight"),
+                            "unexpected WaitVM error during re-attach: {err:?}"
+                        );
+                        c.shutdown().await;
+                        timer.sleep(Duration::from_millis(25)).await;
+                    }
+                    Some(Ok(())) => panic!("WaitVm resolved unexpectedly before GuestHalt"),
+                    None => {
+                        acquired = Some((c, w));
+                        break;
+                    }
+                }
+            }
+            let (client2, wait2) =
+                acquired.expect("Client 2 could not re-attach WaitVM after Client 1 disconnected");
+
+            // Confirm Client 2 now owns the single WaitVM slot.
+            let probe2 = connect(&sock_path);
+            let err2 = probe2
+                .call()
+                .start(vmservice::Vm::WaitVm, ())
+                .await
+                .unwrap_err();
+            assert!(
+                err2.message.contains("wait VM already in flight"),
+                "expected probe2 to see Client 2's WaitVM in flight, got: {err2:?}"
+            );
+            probe2.shutdown().await;
+
+            // Halting the guest resolves Client 2's WaitVM cleanly.
+            event_send.send(VmControllerEvent::GuestHalt("power off".into()));
+            wait2.await.unwrap();
+
+            event_send.send(VmControllerEvent::ExitRequested { code: 0 });
+            client2.shutdown().await;
+            assert_eq!(server_task.await.unwrap(), 0);
         });
     }
 
@@ -4566,6 +5037,17 @@ mod tests {
                     nic_config: vec![Default::default()],
                     ..Default::default()
                 }),
+                ..Default::default()
+            },
+            vmservice::VmConfig {
+                devices_config: Some(vmservice::DevicesConfig {
+                    enable_scsi_controller: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            vmservice::VmConfig {
+                fastdesk_config: Some(Default::default()),
                 ..Default::default()
             },
         ] {
@@ -4875,6 +5357,315 @@ mod tests {
                 vfio_bar_address(0, Some(Source::Fixed(0x1000))),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn make_disk_config_dvd_uses_emulated_dvd_handle() {
+        DefaultPool::run_with(async |_| {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            file.as_file().set_len(2048).unwrap();
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 2,
+                host_path: file.path().to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                read_only: false,
+                is_dvd: true,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.path.lun, 2);
+            assert_eq!(disk.device.id(), "emulated_dvd");
+
+            let empty_dvd = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 3,
+                host_path: String::new(),
+                r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                read_only: true,
+                is_dvd: true,
+            })
+            .await
+            .unwrap();
+            assert_eq!(empty_dvd.path.lun, 3);
+            assert_eq!(empty_dvd.device.id(), "emulated_dvd");
+        });
+    }
+
+    #[test]
+    fn reset_vm_dispatches_vm_rpc_reset() {
+        DefaultPool::run_with(async |driver| {
+            let (worker_send, mut worker_recv) = mesh::channel();
+            let mut service = service(driver, None);
+            Arc::get_mut(service.vm.as_mut().unwrap())
+                .unwrap()
+                .worker_rpc = worker_send;
+
+            let (response, result) = mesh::oneshot();
+            let handle_fut = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ResetVm((), response),
+            );
+            let responder = async {
+                let VmRpc::Reset(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Reset");
+                };
+                rpc.complete(Ok(()));
+            };
+            futures::join!(handle_fut, responder);
+            result.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn properties_vm_reports_fastdesk_endpoints() {
+        DefaultPool::run_with(async |driver| {
+            let mut service = service(driver, None);
+            service.fastdesk_listen_addr = Some("tcp://127.0.0.1:49152".into());
+            service.fastdesk_shm_path = Some("/dev/shm/vram.shm".into());
+            let props = service.build_properties();
+            assert_eq!(
+                props.fastdesk_listen_addr.as_deref(),
+                Some("tcp://127.0.0.1:49152")
+            );
+            assert_eq!(
+                props.fastdesk_shm_path.as_deref(),
+                Some("/dev/shm/vram.shm")
+            );
+        });
+    }
+
+    #[test]
+    fn fastdesk_max_clients_zero_uses_worker_default() {
+        assert_eq!(resolve_fastdesk_max_clients(0), 16);
+        assert_eq!(resolve_fastdesk_max_clients(4), 4);
+    }
+
+    #[test]
+    fn make_disk_config_honors_declared_raw_with_vhdx_magic() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let raw_path = dir.path().join("raw.img");
+            let mut payload = vec![0u8; 512];
+            payload[..8].copy_from_slice(b"vhdxfile");
+            std::fs::write(&raw_path, &payload).unwrap();
+
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: raw_path.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypePhysical as i32,
+                read_only: true,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.path.lun, 0);
+            assert_eq!(disk.device.id(), "emulated_disk");
+        });
+    }
+
+    #[test]
+    fn make_disk_config_opens_vhd1_disk() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let vhd_path = dir.path().join("legacy.vhd");
+            let created = openvmm_helpers::disk::create_disk_type(
+                &vhd_path,
+                64 * 1024,
+                OpenDiskOptions {
+                    read_only: false,
+                    direct: false,
+                },
+            )
+            .unwrap();
+            drop(created);
+
+            let disk = make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 1,
+                host_path: vhd_path.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypeVhd1 as i32,
+                read_only: false,
+                is_dvd: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(disk.path.lun, 1);
+            assert_eq!(disk.device.id(), "emulated_disk");
+        });
+    }
+
+    #[test]
+    fn make_disk_config_explicit_vhdx_uses_vhdx_backend() {
+        DefaultPool::run_with(async |_| {
+            let dir = tempfile::tempdir().unwrap();
+            let bad_vhdx = dir.path().join("bad.img");
+            std::fs::write(&bad_vhdx, [0u8; 512]).unwrap();
+
+            let err = match make_disk_config(vmservice::ScsiDisk {
+                controller: 0,
+                lun: 0,
+                host_path: bad_vhdx.to_string_lossy().into(),
+                r#type: vmservice::DiskType::ScsiDiskTypeVhdx as i32,
+                read_only: true,
+                is_dvd: false,
+            })
+            .await
+            {
+                Ok(_) => panic!("expected explicit VHDX open to fail on invalid payload"),
+                Err(err) => err,
+            };
+            assert!(
+                err.chain()
+                    .any(|c| c.to_string().to_ascii_lowercase().contains("vhd")),
+                "{err:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn reset_vm_from_halted_restores_running_and_wait_vm_blocks() {
+        DefaultPool::run_with(async |driver| {
+            let (worker_send, mut worker_recv) = mesh::channel();
+            let mut service = service(driver, None);
+            Arc::get_mut(service.vm.as_mut().unwrap())
+                .unwrap()
+                .worker_rpc = worker_send;
+
+            assert!(
+                service
+                    .handle_controller_event(VmControllerEvent::GuestHalt("PowerOff".into()))
+                    .is_none()
+            );
+            let props = service.build_properties();
+            assert_eq!(props.state, vmservice::VmState::Halted as i32);
+            assert_eq!(props.halt_reason.as_deref(), Some("PowerOff"));
+
+            let (response, result) = mesh::oneshot();
+            let handle_fut = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ResetVm((), response),
+            );
+            let responder = async {
+                let VmRpc::Reset(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Reset");
+                };
+                rpc.complete(Ok(()));
+            };
+            futures::join!(handle_fut, responder);
+            result.await.unwrap().unwrap();
+
+            let props = service.build_properties();
+            assert_eq!(props.state, vmservice::VmState::Running as i32);
+            assert_eq!(props.halt_reason, None);
+
+            // WaitVM must block again rather than returning immediately as Halted.
+            let (wait_resp, mut wait_res) = mesh::oneshot();
+            service
+                .handle(
+                    mesh::CancelContext::new(),
+                    vmservice::Vm::WaitVm((), wait_resp),
+                )
+                .await;
+            assert!(futures::poll!(&mut wait_res).is_pending());
+            assert!(service.wait_vm_response.is_some());
+
+            // PauseVM / ResumeVM must resume updating lifecycle state normally.
+            let (pause_resp, pause_res) = mesh::oneshot();
+            let handle_pause = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::PauseVm((), pause_resp),
+            );
+            let pause_responder = async {
+                let VmRpc::Pause(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Pause");
+                };
+                rpc.complete(true);
+            };
+            futures::join!(handle_pause, pause_responder);
+            pause_res.await.unwrap().unwrap();
+            assert_eq!(
+                service.build_properties().state,
+                vmservice::VmState::Paused as i32
+            );
+
+            let (resume_resp, resume_res) = mesh::oneshot();
+            let handle_resume = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ResumeVm((), resume_resp),
+            );
+            let resume_responder = async {
+                let VmRpc::Resume(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Resume");
+                };
+                rpc.complete(true);
+            };
+            futures::join!(handle_resume, resume_responder);
+            resume_res.await.unwrap().unwrap();
+            assert_eq!(
+                service.build_properties().state,
+                vmservice::VmState::Running as i32
+            );
+        });
+    }
+
+    #[test]
+    fn reset_vm_from_halted_paused_restores_paused() {
+        DefaultPool::run_with(async |driver| {
+            let (worker_send, mut worker_recv) = mesh::channel();
+            let mut service = service(driver, None);
+            Arc::get_mut(service.vm.as_mut().unwrap())
+                .unwrap()
+                .worker_rpc = worker_send;
+
+            assert!(
+                service
+                    .handle_controller_event(VmControllerEvent::GuestHalt("PowerOff".into()))
+                    .is_none()
+            );
+
+            let (pause_resp, pause_res) = mesh::oneshot();
+            let handle_pause = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::PauseVm((), pause_resp),
+            );
+            let pause_responder = async {
+                let VmRpc::Pause(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Pause");
+                };
+                rpc.complete(false);
+            };
+            futures::join!(handle_pause, pause_responder);
+            pause_res.await.unwrap().unwrap();
+
+            let (reset_resp, reset_res) = mesh::oneshot();
+            let handle_reset = service.handle(
+                mesh::CancelContext::new(),
+                vmservice::Vm::ResetVm((), reset_resp),
+            );
+            let reset_responder = async {
+                let VmRpc::Reset(rpc) = worker_recv.next().await.unwrap() else {
+                    panic!("expected VmRpc::Reset");
+                };
+                rpc.complete(Ok(()));
+            };
+            futures::join!(handle_reset, reset_responder);
+            reset_res.await.unwrap().unwrap();
+
+            let props = service.build_properties();
+            assert_eq!(props.state, vmservice::VmState::Paused as i32);
+            assert_eq!(props.halt_reason, None);
+        });
+    }
+
+    #[test]
+    fn default_fastdesk_listen_addr_uses_ephemeral_port() {
+        assert_eq!(default_fastdesk_listen_addr(""), "127.0.0.1:0");
+        assert_eq!(
+            default_fastdesk_listen_addr("127.0.0.1:5910"),
+            "127.0.0.1:5910"
         );
     }
 }

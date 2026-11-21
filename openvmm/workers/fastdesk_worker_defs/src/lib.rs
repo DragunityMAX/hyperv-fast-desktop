@@ -10,6 +10,9 @@ use mesh::MeshPayload;
 use mesh_worker::WorkerId;
 use std::net::TcpListener;
 
+/// Default maximum number of concurrent viewer sessions when `max_clients == 0`.
+pub const DEFAULT_MAX_CLIENTS: usize = 16;
+
 /// Launch parameters for the event-driven FastDesk display/input worker.
 #[derive(MeshPayload)]
 pub struct FastDeskParameters<T> {

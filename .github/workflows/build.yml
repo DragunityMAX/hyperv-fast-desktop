@@ -24,6 +24,7 @@ jobs:
   build-windows-x64:
     name: Build & Package Windows x64 (WHP)
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -39,6 +40,7 @@ jobs:
             openvmm -> openvmm/target
             openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
             fastdesk-viewer -> fastdesk-viewer/target
+            openvmms -> openvmms/target
 
       - name: Download protoc and mu_msvm x64 UEFI firmware
         shell: pwsh
@@ -88,18 +90,48 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+        run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
         run: cargo test
 
-      - name: Build OpenVMM release binary
+      - name: Configure Windows vTPM and OpenSSL build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Ensure Strawberry Perl precedes MSYS perl so OpenSSL/TPM C build scripts succeed.
+          foreach ($dir in @("C:\Program Files\LLVM\bin", "C:\Program Files\NASM", "C:\Strawberry\perl\bin")) {
+            if (Test-Path $dir) {
+              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+          $strawberryPerl = "C:\Strawberry\perl\bin\perl.exe"
+          if (Test-Path $strawberryPerl) {
+            "PERL=$strawberryPerl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Build OpenVMM release binaries
         working-directory: openvmm
-        run: cargo build -p openvmm --release
+        shell: pwsh
+        run: |
+          cargo build -p openvmm --features tpm --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p openvmm-img --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build fastdesk-viewer release binary
         working-directory: fastdesk-viewer
+        run: cargo build --release
+
+      - name: Run openvmms tests
+        working-directory: openvmms
+        env:
+          OPENVMM_REQUIRE_REAL_BINARY: "1"
+        run: cargo test
+
+      - name: Build openvmms release binaries
+        working-directory: openvmms
         run: cargo build --release
 
       - name: Smoke-test and benchmark Windows x64 binaries
@@ -108,10 +140,152 @@ jobs:
           $ErrorActionPreference = "Stop"
           $helpText = & .\openvmm\target\release\openvmm.exe --help 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) { throw "openvmm.exe --help exited with $LASTEXITCODE" }
-          foreach ($flag in @("--fastdesk", "--fastdesk-shm", "--fastdesk-vsock-port", "--vram-mb")) {
+          foreach ($flag in @("--fastdesk", "--fastdesk-shm", "--fastdesk-vsock-port", "--vram-mb", "--tpm")) {
             if ($helpText -notmatch [regex]::Escape($flag)) {
               throw "Missing expected CLI flag '$flag' in openvmm.exe --help"
             }
+          }
+
+          & .\openvmm\target\release\openvmm-img.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "openvmm-img.exe --help failed" }
+          & .\openvmms\target\release\openvmmsd.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "openvmmsd.exe --help failed" }
+          & .\openvmms\target\release\openvmms.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "openvmms.exe --help failed" }
+          $guiTestOut = & .\openvmms\target\release\openvmms-gui.exe --self-test 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or $guiTestOut -notmatch "SELF-TEST OK") {
+            throw "openvmms-gui.exe --self-test failed:`n$guiTestOut"
+          }
+
+          $autoDir = Join-Path $env:RUNNER_TEMP "openvmms-autostart-win"
+          if (Test-Path $autoDir) { Remove-Item -Recurse -Force $autoDir }
+          New-Item -ItemType Directory -Force -Path $autoDir | Out-Null
+          try {
+            $autoOut = & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --json vm list | Out-String
+            if ($LASTEXITCODE -ne 0 -or $autoOut -notmatch '\[\]') {
+              throw "openvmms auto-start stdout-capture check failed (exit $LASTEXITCODE):`n$autoOut"
+            }
+          } finally {
+            try {
+              & .\openvmms\target\release\openvmms.exe --data-dir $autoDir --no-auto-start daemon stop | Out-Null
+            } catch {}
+            Start-Sleep -Milliseconds 300
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $autoDir
+          }
+
+          $smokeDir = Join-Path $env:RUNNER_TEMP "openvmms-smoke-win"
+          if (Test-Path $smokeDir) { Remove-Item -Recurse -Force $smokeDir }
+          New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+          $smokePort = 47691
+          $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\openvmms\target\release\openvmmsd.exe").Path `
+            -ArgumentList @("--data-dir", $smokeDir, "--listen", "127.0.0.1:$smokePort") -PassThru -NoNewWindow
+          try {
+            $deadline = (Get-Date).AddSeconds(15)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:$smokePort/api/v1/health" -TimeoutSec 1
+                if ($r.status -eq "ok") { $healthy = $true; break }
+              } catch {}
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $healthy) { throw "openvmmsd smoke daemon did not become healthy" }
+            $smokeDisk = Join-Path $smokeDir "smoke.img"
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              disk create $smokeDisk --size 16M --format raw | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (raw) failed" }
+            $smokeVhdx = Join-Path $smokeDir "smoke.vhdx"
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              disk create $smokeVhdx --size 64M --format vhdx | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms disk create (vhdx) failed" }
+            $vhdxInfo = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              disk info $smokeVhdx | Out-String | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $vhdxInfo.format -ne "vhdx") {
+              throw "Expected VHDX disk info format 'vhdx', got $($vhdxInfo | ConvertTo-Json -Compress)"
+            }
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              vm create "Smoke-VM" --preset win11 --cpus 2 --memory 2G --disk $smokeDisk | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms vm create failed" }
+            $listJson = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              vm list | Out-String
+            if ($LASTEXITCODE -ne 0 -or $listJson -notmatch "Smoke-VM") {
+              throw "openvmms vm list failed:`n$listJson"
+            }
+            $whpEnabled = $false
+            try {
+              $whpFeature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue
+              if ($null -ne $whpFeature -and $whpFeature.State -eq "Enabled") {
+                $whpEnabled = $true
+              }
+            } catch {}
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              vm start "Smoke-VM" | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+                vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+              if ($show.runtime.status -ne "running") {
+                throw "Expected Smoke-VM status running, got $($show.runtime.status)"
+              }
+              if ([string]::IsNullOrWhiteSpace($show.runtime.fastdesk_endpoint)) {
+                throw "Expected Smoke-VM fastdesk_endpoint to be populated"
+              }
+              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+                vm pause "Smoke-VM" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "openvmms vm pause failed" }
+              & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+                vm resume "Smoke-VM" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "openvmms vm resume failed" }
+            } else {
+              if ($whpEnabled) {
+                throw "openvmms vm start failed even though HypervisorPlatform is enabled"
+              }
+              $show = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+                vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+              if ($show.runtime.status -ne "error") {
+                throw "Expected Smoke-VM to recover cleanly to error when runner lacks WHP, got $($show.runtime.status)"
+              }
+              if ($show.runtime.last_error -notmatch "no hypervisor available|WHP") {
+                throw "Expected Smoke-VM failure to be missing hypervisor/WHP, got: $($show.runtime.last_error)"
+              }
+            }
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              vm stop "Smoke-VM" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms vm stop failed" }
+            # Verify daemon stop + restart preserves VM registry and disk state cleanly on Windows.
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              daemon stop | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop (restart check) failed" }
+            if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
+              throw "openvmmsd smoke daemon did not exit cleanly before restart (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+            }
+            $smokeDaemon = Start-Process -FilePath (Resolve-Path ".\openvmms\target\release\openvmmsd.exe").Path `
+              -ArgumentList @("--data-dir", $smokeDir, "--listen", "127.0.0.1:$smokePort") -PassThru -NoNewWindow
+            $deadline = (Get-Date).AddSeconds(15)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:$smokePort/api/v1/health" -TimeoutSec 1
+                if ($r.status -eq "ok") { $healthy = $true; break }
+              } catch {}
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $healthy) { throw "restarted openvmmsd smoke daemon did not become healthy" }
+            $restartedShow = & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start --json `
+              vm show "Smoke-VM" | Out-String | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $restartedShow.config.name -ne "Smoke-VM") {
+              throw "Expected Smoke-VM to persist across Windows daemon restart"
+            }
+            & .\openvmms\target\release\openvmms.exe --data-dir $smokeDir --daemon-url "http://127.0.0.1:$smokePort" --no-auto-start `
+              daemon stop --stop-vms | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "openvmms daemon stop --stop-vms failed" }
+            if (-not $smokeDaemon.WaitForExit(15000) -or $smokeDaemon.ExitCode -ne 0) {
+              throw "openvmmsd smoke daemon did not exit cleanly (Exited=$($smokeDaemon.HasExited), Code=$($smokeDaemon.ExitCode))"
+            }
+          } finally {
+            if ($null -ne $smokeDaemon -and -not $smokeDaemon.HasExited) {
+              Stop-Process -Id $smokeDaemon.Id -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $smokeDir
           }
 
           $benchOut = & .\fastdesk-viewer\target\release\fastdesk-viewer.exe `
@@ -142,7 +316,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bundle, $fwDir | Out-Null
 
           Copy-Item -Force "openvmm\target\release\openvmm.exe" $bundle
+          Copy-Item -Force "openvmm\target\release\openvmm-img.exe" $bundle
           Copy-Item -Force "fastdesk-viewer\target\release\fastdesk-viewer.exe" $bundle
+          Copy-Item -Force "openvmms\target\release\openvmmsd.exe" $bundle
+          Copy-Item -Force "openvmms\target\release\openvmms.exe" $bundle
+          Copy-Item -Force "openvmms\target\release\openvmms-gui.exe" $bundle
           Copy-Item -Force "openvmm\.packages\hyperv.uefi.mscoreuefi.x64.RELEASE\MsvmX64\RELEASE_VS2022\FV\MSVM.fd" (Join-Path $fwDir "MSVM.fd")
           Copy-Item -Force "scripts\Start-OpenVmmFastDesktop.ps1" $bundle
           Copy-Item -Force "scripts\Setup-HyperVGpuPvAndHvsock.ps1" $bundle
@@ -151,14 +329,20 @@ jobs:
           $benchText = Get-Content -Raw (Join-Path $env:RUNNER_TEMP "bench-windows-x64.txt")
           $utcNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
           @(
-            "OpenVMM FastDesk Bundle (Windows x64)"
+            "OpenVMM FastDesk & OpenVMMS Bundle (Windows x64)"
             "Commit: $($env:GITHUB_SHA)"
             "Ref: $($env:GITHUB_REF_NAME)"
             "Built (UTC): $utcNow"
             "Target: x86_64-pc-windows-msvc"
             "UEFI Firmware: microsoft/mu_msvm v$($env:MU_MSVM_VERSION) (firmware\MSVM.fd)"
             ""
-            "Quickstart (PowerShell on Windows 11 with WHP enabled):"
+            "Quickstart (OpenVMMS GUI & CLI on Windows 11 with WHP enabled):"
+            "  .\openvmms-gui.exe"
+            "  .\openvmms.exe vm create Win11-Dev --preset win11 --create-disk 64G --iso C:\ISOs\Win11.iso"
+            "  .\openvmms.exe vm start Win11-Dev"
+            "  .\openvmms.exe vm connect Win11-Dev"
+            ""
+            "Standalone Script Quickstart:"
             "  .\Start-OpenVmmFastDesktop.ps1 -DiskPath C:\VMs\win11.vhdx -Memory 8G -Processors 4"
             ""
             "Self-Test Benchmark (1920x1080, 200 frames):"
@@ -187,6 +371,7 @@ jobs:
   build-linux-x64:
     name: Build & Package Linux x64
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -196,7 +381,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake pkg-config libssl-dev \
+            cmake perl pkg-config libssl-dev \
             libx11-dev libxkbcommon-dev libwayland-dev
 
       - name: Install stable Rust toolchain
@@ -209,6 +394,7 @@ jobs:
             openvmm -> openvmm/target
             openvmm/workers/fastdesk_proto -> openvmm/workers/fastdesk_proto/target
             fastdesk-viewer -> fastdesk-viewer/target
+            openvmms -> openvmms/target
 
       - name: Download protoc and mu_msvm x64 UEFI firmware
         run: |
@@ -247,30 +433,160 @@ jobs:
 
       - name: Run OpenVMM display and FastDesk worker tests
         working-directory: openvmm
-        run: cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
+        run: cargo test -p mesh_rpc -p video_core -p framebuffer -p uidevices -p fastdesk_worker -p disklayer_vhdx -p openvmm_helpers -p openvmm_entry --lib
 
       - name: Run fastdesk-viewer tests
         working-directory: fastdesk-viewer
         run: cargo test
 
-      - name: Build OpenVMM release binary
+      - name: Build OpenVMM release binaries
         working-directory: openvmm
-        run: cargo build -p openvmm --release
+        run: |
+          cargo build -p openvmm --features tpm --release
+          cargo build -p openvmm-img --release
 
       - name: Build fastdesk-viewer release binary
         working-directory: fastdesk-viewer
+        run: cargo build --release
+
+      - name: Enable KVM access for real-OpenVMM tests
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "Expected /dev/kvm on Linux runner to verify real VM startup" >&2
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+
+      - name: Run openvmms tests
+        working-directory: openvmms
+        env:
+          OPENVMM_REQUIRE_REAL_BINARY: "1"
+          OPENVMM_REQUIRE_REAL_KVM_TEST: "1"
+        run: cargo test
+
+      - name: Build openvmms release binaries
+        working-directory: openvmms
         run: cargo build --release
 
       - name: Smoke-test and benchmark Linux x64 binaries
         run: |
           set -euo pipefail
           HELP_TEXT="$(./openvmm/target/release/openvmm --help)"
-          for flag in --fastdesk --fastdesk-shm --fastdesk-vsock-port --vram-mb; do
+          for flag in --fastdesk --fastdesk-shm --fastdesk-vsock-port --vram-mb --tpm; do
             if [[ "$HELP_TEXT" != *"$flag"* ]]; then
               echo "Missing expected flag: $flag" >&2
               exit 1
             fi
           done
+
+          ./openvmm/target/release/openvmm-img --help >/dev/null
+          ./openvmms/target/release/openvmmsd --help >/dev/null
+          ./openvmms/target/release/openvmms --help >/dev/null
+          ./openvmms/target/release/openvmms-gui --self-test | grep -q "SELF-TEST OK"
+
+          AUTO_DIR="$RUNNER_TEMP/openvmms-autostart-linux"
+          rm -rf "$AUTO_DIR"
+          mkdir -p "$AUTO_DIR"
+          cleanup_auto() {
+            ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --no-auto-start daemon stop >/dev/null 2>&1 || true
+            rm -rf "$AUTO_DIR"
+          }
+          trap cleanup_auto EXIT
+          AUTO_OUT="$(timeout 15s ./openvmms/target/release/openvmms --data-dir "$AUTO_DIR" --json vm list)"
+          echo "$AUTO_OUT" | grep -q '\[\]'
+          cleanup_auto
+          trap - EXIT
+
+          SMOKE_DIR="$RUNNER_TEMP/openvmms-smoke-linux"
+          rm -rf "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR"
+          SMOKE_PORT=47692
+          ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" &
+          SMOKE_PID=$!
+          cleanup_smoke() {
+            kill "$SMOKE_PID" 2>/dev/null || true
+            wait "$SMOKE_PID" 2>/dev/null || true
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup_smoke EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          if [ ! -e /dev/kvm ]; then
+            echo "Expected /dev/kvm on Linux runner to verify real VM startup" >&2
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            disk create "$SMOKE_DIR/smoke.img" --size 16M --format raw >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            disk create "$SMOKE_DIR/smoke.vhdx" --size 64M --format vhdx >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            disk info "$SMOKE_DIR/smoke.vhdx" | grep -q '"format": "vhdx"'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm create "Smoke-VM" --preset linux --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.img" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm list | grep -q "Smoke-VM"
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm start "Smoke-VM" >/dev/null
+          SHOW_JSON="$(./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json vm show "Smoke-VM")"
+          echo "$SHOW_JSON" | grep -q '"status": "running"'
+          echo "$SHOW_JSON" | grep -q '"fastdesk_endpoint": "tcp://'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm pause "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "paused"'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm resume "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "running"'
+          # Default daemon stop must exit promptly while preserving the running VM across restart.
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            daemon stop >/dev/null
+          wait "$SMOKE_PID"
+          RUST_LOG=info ./openvmms/target/release/openvmmsd --data-dir "$SMOKE_DIR" --listen "127.0.0.1:${SMOKE_PORT}" \
+            >"$SMOKE_DIR/daemon2.log" 2>&1 &
+          SMOKE_PID=$!
+          for _ in $(seq 1 100); do
+            if curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/v1/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          sleep 1
+          if ! grep -q "re-adopted running OpenVMM VM" "$SMOKE_DIR/daemon2.log"; then
+            echo "Expected re-adoption log line in daemon2.log:" >&2
+            cat "$SMOKE_DIR/daemon2.log" >&2
+            exit 1
+          fi
+          if grep -qiE "wait VM already in flight|WaitVM returned error" "$SMOKE_DIR/daemon2.log"; then
+            echo "Unexpected WaitVM error after daemon restart in daemon2.log:" >&2
+            cat "$SMOKE_DIR/daemon2.log" >&2
+            exit 1
+          fi
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "running"'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm stop "Smoke-VM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-VM" | grep -q '"status": "off"'
+          # Verify win11 preset enables vTPM 2.0 and boots openvmm with --tpm.
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm create "Smoke-Win11-TPM" --preset win11 --cpus 2 --memory 2G --disk "$SMOKE_DIR/smoke.vhdx" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-Win11-TPM" | grep -q '"tpm_enabled": true'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            vm start "Smoke-Win11-TPM" >/dev/null
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start --json \
+            vm show "Smoke-Win11-TPM" | grep -q '"status": "running"'
+          ./openvmms/target/release/openvmms --data-dir "$SMOKE_DIR" --daemon-url "http://127.0.0.1:${SMOKE_PORT}" --no-auto-start \
+            daemon stop --stop-vms >/dev/null
+          wait "$SMOKE_PID"
+          trap - EXIT
+          rm -rf "$SMOKE_DIR"
 
           BENCH_FILE="$RUNNER_TEMP/bench-linux-x64.txt"
           ./fastdesk-viewer/target/release/fastdesk-viewer \
@@ -292,9 +608,17 @@ jobs:
           mkdir -p "$BUNDLE/firmware"
 
           cp -f "openvmm/target/release/openvmm" "$BUNDLE/openvmm"
+          cp -f "openvmm/target/release/openvmm-img" "$BUNDLE/openvmm-img"
           cp -f "fastdesk-viewer/target/release/fastdesk-viewer" "$BUNDLE/fastdesk-viewer"
-          strip --strip-debug "$BUNDLE/openvmm" "$BUNDLE/fastdesk-viewer"
-          chmod +x "$BUNDLE/openvmm" "$BUNDLE/fastdesk-viewer"
+          cp -f "openvmms/target/release/openvmmsd" "$BUNDLE/openvmmsd"
+          cp -f "openvmms/target/release/openvmms" "$BUNDLE/openvmms"
+          cp -f "openvmms/target/release/openvmms-gui" "$BUNDLE/openvmms-gui"
+          strip --strip-debug \
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
+            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
+          chmod +x \
+            "$BUNDLE/openvmm" "$BUNDLE/openvmm-img" "$BUNDLE/fastdesk-viewer" \
+            "$BUNDLE/openvmmsd" "$BUNDLE/openvmms" "$BUNDLE/openvmms-gui"
 
           cp -f "openvmm/.packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV/MSVM.fd" "$BUNDLE/firmware/MSVM.fd"
           cp -f "scripts/start-openvmm-fastdesk.sh" "$BUNDLE/start-openvmm-fastdesk.sh"
@@ -302,14 +626,20 @@ jobs:
           cp -f "README.md" "$BUNDLE/README.md"
 
           {
-            echo "OpenVMM FastDesk Bundle (Linux x64)"
+            echo "OpenVMM FastDesk & OpenVMMS Bundle (Linux x64)"
             echo "Commit: $GITHUB_SHA"
             echo "Ref: $GITHUB_REF_NAME"
             echo "Built (UTC): $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "Target: x86_64-unknown-linux-gnu"
             echo "UEFI Firmware: microsoft/mu_msvm v${MU_MSVM_VERSION} (firmware/MSVM.fd)"
             echo ""
-            echo "Quickstart:"
+            echo "Quickstart (OpenVMMS GUI & CLI):"
+            echo "  ./openvmms-gui"
+            echo "  ./openvmms vm create Linux-Dev --preset linux --create-disk 32G --iso /path/to/ubuntu.iso"
+            echo "  ./openvmms vm start Linux-Dev"
+            echo "  ./openvmms vm connect Linux-Dev"
+            echo ""
+            echo "Standalone Script Quickstart:"
             echo "  ./start-openvmm-fastdesk.sh --disk /path/to/win11.vhdx --memory 8G --cpus 4"
             echo ""
             echo "Self-Test Benchmark (1920x1080, 200 frames):"
@@ -337,6 +667,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: [build-windows-x64, build-linux-x64]

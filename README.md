@@ -1,19 +1,42 @@
 # OpenVMM FastDesk (`hyperv-fast-desktop`)
 
-A high-speed, low-latency 2D desktop display and input pipeline built on a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) (upstream base commit `c4419be15ab702194f0a25c294bd2f6187804824`), paired with a standalone native desktop viewer (`fastdesk-viewer`) and turnkey Windows/Linux launcher scripts.
+A high-speed, low-latency 2D desktop display and input pipeline built on a fork of [`microsoft/openvmm`](https://github.com/microsoft/openvmm) (upstream base commit `c4419be15ab702194f0a25c294bd2f6187804824`; carried vendored patches are tracked in [`patches/README.md`](patches/README.md)), paired with a standalone native desktop viewer (`fastdesk-viewer`) and turnkey Windows/Linux launcher scripts.
 
 ## Prebuilt GitHub Actions Artifacts & Quickstart
 
 The GitHub Actions workflow ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds, tests, smoke-benchmarks, and packages self-contained bundles on every push, pull request, manual `workflow_dispatch`, and `v*` tag (publishing a GitHub Release on tags):
 
 - **Windows x64 bundle (`openvmm-fastdesk-windows-x64`)**:
-  - `openvmm.exe` (`x86_64-pc-windows-msvc` with WHP + FastDesk enabled)
+  - `openvmm.exe` (`x86_64-pc-windows-msvc` with WHP + FastDesk + vTPM 2.0 + RPC extensions enabled)
+  - `openvmm-img.exe` (VHDX creation, inspection, and verification tool)
   - `fastdesk-viewer.exe` (native Win32 GDI + zero-copy shared VRAM viewer)
+  - `openvmmsd.exe`, `openvmms.exe`, `openvmms-gui.exe` (OpenVMMS daemon, CLI, and Hyper-V-style desktop manager)
   - `firmware/MSVM.fd` (`microsoft/mu_msvm` `v26.0.44` x64 UEFI firmware)
   - `Start-OpenVmmFastDesktop.ps1` (auto-discovers `openvmm.exe`, `fastdesk-viewer.exe`, and `firmware/MSVM.fd`)
   - `Setup-HyperVGpuPvAndHvsock.ps1`
 - **Linux x64 bundle (`openvmm-fastdesk-linux-x64`)**:
-  - `openvmm`, `fastdesk-viewer`, `firmware/MSVM.fd`, and `start-openvmm-fastdesk.sh`
+  - `openvmm`, `openvmm-img`, `fastdesk-viewer`, `openvmmsd`, `openvmms`, `openvmms-gui`, `firmware/MSVM.fd`, and `start-openvmm-fastdesk.sh`
+
+### Quickstart with OpenVMMS (Hyper-V-Style Manager GUI & CLI)
+
+Launch the native desktop manager (auto-starts `openvmmsd` on `127.0.0.1:47620` if needed):
+```powershell
+.\openvmms-gui.exe
+```
+Or manage VMs from the CLI (`openvmms`):
+```powershell
+# Create a Windows 11 VM with a 64 GiB VHDX disk and installer ISO
+.\openvmms.exe vm create Win11-Dev --preset win11 --cpus 4 --memory 8G --create-disk 64G --iso C:\ISOs\Win11.iso
+
+# Start the VM and launch FastDesk zero-copy viewer
+.\openvmms.exe vm start Win11-Dev
+.\openvmms.exe vm connect Win11-Dev
+
+# Live management while running: ISO swap, disk hot-plug, NAT port forwards, pause/resume/reset/shutdown
+.\openvmms.exe vm iso eject Win11-Dev
+.\openvmms.exe vm port-add Win11-Dev "tcp:127.0.0.1:3389->3389"
+.\openvmms.exe vm shutdown Win11-Dev
+```
 
 ### Quickstart on Windows 11 (After Extracting `openvmm-fastdesk-windows-x64`)
 
@@ -64,7 +87,15 @@ Stock OpenVMM (`--gfx`) drives its VNC worker (`workers/vnc_worker`) on a fixed 
   - Supports **Zero-Copy Shared Memory (`ShmDirtyOnly`)** when `--fastdesk-shm <PATH>` is provided (0 pixel bytes sent over the socket; `fastdesk-viewer` maps the backing VRAM file read-only via `memmap2`) as well as **LZ4 Dirty-Tile** streaming over TCP (`FASTDESK_WORKER_TCP`) or `AF_HYPERV` / `AF_VSOCK` (`FASTDESK_WORKER_VMSOCKET`).
   - Integrated into `openvmm` via `--fastdesk`, `--fastdesk-listen <ADDR>` (default `127.0.0.1:5901`), `--fastdesk-vsock-port <PORT>`, `--fastdesk-shm <PATH>`, and `--vram-mb <MB>`.
 
-### 3. Standalone Native Viewer (`fastdesk-viewer`)
+### 3. OpenVMMS Management Stack (`openvmms/`)
+- Separate Cargo workspace (`openvmms/`) providing a Hyper-V-style control plane on top of OpenVMM's `vmservice.VM` `ttrpc` server over `AF_UNIX` (Windows 10/11 & Linux):
+  - **`openvmms-core`**: Shared registry/VM config (`vm.toml`), cross-platform pure-Rust `ttrpc` client (`socket2`), disk orchestration, and authenticated HTTP/SSE client.
+  - **`openvmmsd`**: Management daemon supervising per-VM `openvmm --rpc` processes, zero-copy SHM VRAM files, `WaitVM` lifecycle tracking, live hot-plug SCSI/ISO/`consomme` port forwards, virtual switch discovery, and local REST + SSE API (`127.0.0.1:47620` + `daemon.token`).
+  - **`openvmms`**: Scriptable CLI with formatted tables and `--json` output (including `vm disk attach --format <vhdx|vhd|raw|iso>`).
+  - **`openvmms-gui`**: Native desktop GUI (`eframe`/`egui`) with a 3-pane Hyper-V Manager layout, New VM Wizard, Disk Manager (VHDX/Raw), live Storage/ISO/Networking tabs, log viewer, and one-click FastDesk launch.
+  - **Security Model (Single-User Desktop Host):** OpenVMMS and FastDesk are designed for single-user workstation hosts rather than multi-tenant shared servers. The `openvmmsd` REST/SSE API binds to `127.0.0.1` only and requires the per-installation `daemon.token` (`0600` on Unix, current-user DACL on Windows), while each VM's per-instance FastDesk console listener (`fastdesk.listen_addr`) binds an unauthenticated loopback TCP address (`127.0.0.1`) or explicit `AF_HYPERV`/`AF_VSOCK` endpoint (`vsock_port`). Only trusted local OS accounts with desktop session access should share the host while VMs are running.
+
+### 4. Standalone Native Viewer (`fastdesk-viewer`)
 - Located in `fastdesk-viewer/` (separate Cargo workspace so Win32 GDI/windowing links cleanly without OpenVMM's `onecore_apiset.lib` constraint).
 - Supports `tcp://host:port`, `hvsock://<vm_guid>/<port_or_guid>` (`AF_HYPERV` on Windows), and `vsock://<cid>:<port>` (`AF_VSOCK` on Linux).
 - Client-side alpha-blended hardware cursor compositing (restoring only the bounded cursor rect from backing framebuffer) and raw XT Set 1 / `0xE0` keyboard scancodes + `[0..=32767]` HID absolute mouse + wheel input.
@@ -87,8 +118,8 @@ cd openvmm
 cargo test -p video_core -p framebuffer -p uidevices -p fastdesk_worker
 cd workers/fastdesk_proto && cargo test
 cd ../..
-cargo build -p openvmm
-./target/debug/openvmm --help | grep -E "fastdesk|vram-mb"
+cargo build -p openvmm --features tpm
+./target/debug/openvmm --help | grep -E "fastdesk|vram-mb|tpm"
 ```
 
 ### 2. Standalone `fastdesk-viewer` (Linux Native + Windows `.exe`)
@@ -101,6 +132,14 @@ cargo build --release --target x86_64-pc-windows-gnu
 Built binaries:
 - Linux ELF: `fastdesk-viewer/target/release/fastdesk-viewer`
 - Windows x86_64 PE: `fastdesk-viewer/target/x86_64-pc-windows-gnu/release/fastdesk-viewer.exe`
+
+### 3. OpenVMMS Workspace (`openvmmsd`, `openvmms`, `openvmms-gui`)
+```bash
+cd openvmms
+cargo test
+cargo build --release
+./target/release/openvmms-gui --self-test
+```
 
 ## Windows Usage Scripts
 

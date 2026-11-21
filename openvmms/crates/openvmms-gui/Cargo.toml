@@ -1,0 +1,27 @@
+[package]
+name = "openvmms-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "openvmms-gui"
+path = "src/main.rs"
+
+[dependencies]
+openvmms-core = { path = "../openvmms-core" }
+openvmmsd = { path = "../openvmmsd" }
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

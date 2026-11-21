@@ -27,6 +27,9 @@ service VM {
     // has had PauseVM called on it, or to start a VM that was created with CreateVM.
     rpc ResumeVM(google.protobuf.Empty) returns (google.protobuf.Empty);
 
+    // ResetVM triggers an immediate guest reset without tearing down the VM service.
+    rpc ResetVM(google.protobuf.Empty) returns (google.protobuf.Empty);
+
     // SaveVM captures the VM's memory, device state, and processor state into
     // a new snapshot directory and returns a unique snapshot ID, which is also
     // stored in the snapshot manifest. The current implementation hard-links
@@ -265,6 +268,9 @@ message DevicesConfig {
     // Single-port console devices, enumerated by the guest as hvc0, hvc1, and
     // so on in list order.
     repeated VirtioConsoleConfig virtio_consoles = 6;
+    // Create the VTL0 VMBus SCSI controller even when scsi_disks is empty so
+    // disks/ISOs can be hot-added later via ModifyResource.
+    bool enable_scsi_controller = 7;
 }
 
 // An endpoint PCIe device function. Attached behind a port in the topology
@@ -760,6 +766,20 @@ message PcieAttachment {
     }
 }
 
+message FastDeskConfig {
+    // Framebuffer VRAM size in MiB (clamped to 8..=256; defaults to 32 when 0).
+    uint32 vram_mb = 1;
+    // TCP listen address, e.g. "127.0.0.1:0" or "127.0.0.1:5901".
+    // Used when vsock_port is not set (defaults to "127.0.0.1:0" if empty).
+    string listen_addr = 2;
+    // Optional AF_HYPERV / AF_VSOCK port instead of TCP.
+    optional uint32 vsock_port = 3;
+    // Optional host file path for zero-copy shared VRAM mapping.
+    optional string shm_path = 4;
+    // Optional maximum concurrent viewer clients (0 = worker default).
+    uint32 max_clients = 5;
+}
+
 message VMConfig {
     // Action for the VMM to take when the guest triggers a power event.
     enum GuestPowerAction {
@@ -842,6 +862,11 @@ message VMConfig {
     // Enable the guest watchdog device. Timeout behavior is configured
     // separately by guest_power_actions.watchdog.
     bool guest_watchdog = 22;
+    // Enable FastDesk 2D synthetic video, keyboard, and mouse devices and
+    // launch the event-driven FastDesk display/input worker.
+    FastDeskConfig fastdesk_config = 23;
+    // Enable an emulated vTPM 2.0 device (requires UEFI boot).
+    bool tpm_enabled = 24;
 }
 
 // WindowsOptions contains virtual machine configurations that are only present on a Windows host.
@@ -978,6 +1003,10 @@ message PropertiesVMResponse {
     VmState state = 3;
     // Set when state is Halted.
     optional string halt_reason = 4;
+    // Active FastDesk listener endpoint when FastDesk is enabled.
+    optional string fastdesk_listen_addr = 5;
+    // Active FastDesk shared VRAM file path when SHM zero-copy is enabled.
+    optional string fastdesk_shm_path = 6;
 }
 
 message CapabilitiesVMResponse {
@@ -1027,6 +1056,8 @@ message SCSIDisk {
     string host_path = 3;
     DiskType type = 4;
     bool read_only = 5;
+    // Attach as a virtual DVD/ISO optical drive (SimpleScsiDvdHandle) instead of a disk.
+    bool is_dvd = 6;
 }
 
 message VPMEMDisk {

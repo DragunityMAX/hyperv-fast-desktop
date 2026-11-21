@@ -17,6 +17,68 @@ use vm_resource::IntoResource;
 use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
 
+#[cfg(unix)]
+fn acquire_writable_disk_lock(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "disk image '{}' is already locked for writing by another process",
+                    path.display()
+                );
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err)
+                    .with_context(|| format!("failed to lock disk image {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_vhdx_file_locked(
+    path: &Path,
+    read_only: bool,
+    layer_idx: Option<usize>,
+) -> anyhow::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(!read_only);
+
+    #[cfg(windows)]
+    if !read_only && path.is_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny concurrent writers (`FILE_SHARE_READ` without `FILE_SHARE_WRITE`).
+        opts.share_mode(0x0000_0001);
+    }
+
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(err) if !read_only && err.raw_os_error() == Some(32) => {
+            anyhow::bail!(
+                "disk image '{}' is already locked for writing by another process",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return match layer_idx {
+                Some(i) => Err(err).with_context(|| {
+                    format!("failed to open vhdx layer {}: {}", i, path.display())
+                }),
+                None => Err(err.into()),
+            };
+        }
+    };
+
+    #[cfg(unix)]
+    if !read_only {
+        acquire_writable_disk_lock(&file, path)?;
+    }
+
+    Ok(file)
+}
+
 /// Open a single VHDX file as a [`LayeredDiskHandle`] with one layer.
 ///
 /// Use this for base (non-differencing) VHDX files. For differencing chains,
@@ -24,10 +86,7 @@ use vm_resource::kind::DiskHandleKind;
 ///
 /// The file is opened for read+write unless `read_only` is true.
 pub fn open_vhdx_single(path: &Path, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!read_only)
-        .open(path)?;
+    let file = open_vhdx_file_locked(path, read_only, None)?;
 
     Ok(Resource::new(LayeredDiskHandle::single_layer(
         VhdxDiskLayerHandle { file, read_only },
@@ -73,11 +132,7 @@ pub fn open_vhdx_chain_explicit(
             let is_leaf = i == 0;
             let layer_read_only = !is_leaf || read_only;
 
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!layer_read_only)
-                .open(path)
-                .with_context(|| format!("failed to open vhdx layer {}: {}", i, path.display()))?;
+            let file = open_vhdx_file_locked(path, layer_read_only, Some(i))?;
 
             let handle = VhdxDiskLayerHandle {
                 file,
@@ -357,5 +412,26 @@ mod tests {
 
         let resource = open_vhdx_chain(&path, false).await.unwrap();
         let _ = resource;
+    }
+
+    #[pal_async::async_test]
+    async fn rejects_concurrent_writable_vhdx_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.vhdx");
+
+        let bf = crate::io::BlockingFile::open(&path, false).unwrap();
+        let mut params = vhdx::CreateParams {
+            disk_size: 1024 * 1024,
+            ..Default::default()
+        };
+        vhdx::create(&bf, &mut params).await.unwrap();
+        drop(bf);
+
+        let first = open_vhdx_chain(&path, false).await.unwrap();
+        let err = open_vhdx_chain(&path, false).await.unwrap_err();
+        assert!(err.to_string().contains("already locked for writing"), "{err:#}");
+
+        drop(first);
+        open_vhdx_chain(&path, false).await.unwrap();
     }
 }
